@@ -88,10 +88,10 @@ class DQN():
 
         print("Cost: {0}".format(self.cost.eval(
             feed_dict={
-            self.y_input: y_batch,
-            self.action_input: action_batch,
-            self.state_input: state_batch
-        }
+                self.y_input: y_batch,
+                self.action_input: action_batch,
+                self.state_input: state_batch
+            }
         )))
         # print("Q value: {0}".format(self.Q_value.eval(
         #     feed_dict={self.state_input: next_state_batch}

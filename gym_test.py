@@ -17,4 +17,4 @@ for i_episode in range(EPISODE):
             print("Episode finished after {} timesteps.".format(t + 1))
             break
     print("total reward: {0}".format(total_reword))
-    raw_input()
+    c = input()
