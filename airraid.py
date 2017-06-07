@@ -10,8 +10,8 @@ PLAY_STEP = 100
 
 
 def train_air_raid(train_display=False, test_display=True,
-                  record_test=True, record_path="records",
-                  record_cost=False):
+                   record_test=True, record_path="records",
+                   record_cost=False):
     env = gym.make('AirRaid-v0')
     # env = gym.wrappers.Monitor(env, './airraid-experiment')
 
@@ -77,9 +77,13 @@ def train_air_raid(train_display=False, test_display=True,
 
     env.close()
 
+
 def play_air_raid(test_display=False):
+    import time
+    time_str = time.strftime("%Y%m%d_%H%M%S")
+
     env = gym.make('AirRaid-v0')
-    env = gym.wrappers.Monitor(env, './airraid-experiment', force=True)
+    env = gym.wrappers.Monitor(env, './play_videos/' + time_str)
 
     # init DQNBrain
     brain = DQNBrain(env, pooling_scale=4, record=False)  # , [8, 4], [16, 32], 256, 4)
@@ -129,10 +133,10 @@ if __name__ == '__main__':
             mode = 't'
 
     if mode in ("t", "train"):
-        train_air_raid(train_display=False, test_display=True, 
-        record_test=True, record_cost=False)
+        train_air_raid(train_display=False, test_display=True,
+                       record_test=True, record_cost=False)
     elif mode in ("p", "play"):
         play_air_raid()
     else:
         print("Invalid argument! Mode can only be 't' or 'p', but '{0}' "
-            "received.".format(mode))
+              "received.".format(mode))
