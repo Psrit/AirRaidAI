@@ -1,12 +1,12 @@
 import gym
-from airraid import EPISODE, STEP
+from airraid import NUM_EPISODES, NUM_STEPS_PER_EPISODE
 
 env = gym.make('AirRaid-v0')
 print(type(env))
-for i_episode in range(EPISODE):
+for i_episode in range(NUM_EPISODES):
     observation = env.reset()
     total_reword = 0
-    for t in range(STEP):
+    for t in range(NUM_STEPS_PER_EPISODE):
         env.render()
         # print(observation.shape)
         action = env.action_space.sample()

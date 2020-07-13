@@ -2,11 +2,15 @@ import gym
 from dqn import DQNBrain
 import os, sys, getopt
 
-EPISODE = 100  # Episode limitation
-STEP = 300  # Step limitation in an episode
-TEST_NUM = 5  # The number of experiment test every `TEST_STEP` episode
-TEST_STEP = 5
-PLAY_STEP = 100
+NUM_EPISODES = 100  # Episode limitation
+NUM_STEPS_PER_EPISODE = 300  # Step limitation in an episode
+
+# For every `NUM_EPISODES_FOR_NEXT_TEST_ROUND` episodes, conduct one round of
+# test, which includes `NUM_TESTS_PER_TEST_ROUND` tests.
+# In each test, we play the game for `NUM_STEPS_PER_EPISODE` steps (if the game
+# is not lost).
+NUM_EPISODES_FOR_NEXT_TEST_ROUND = 5
+NUM_TESTS_PER_TEST_ROUND = 5
 
 
 def train_air_raid(train_display=False, test_display=True,
@@ -25,11 +29,11 @@ def train_air_raid(train_display=False, test_display=True,
     # init Q network
     brain.initialize_network()
 
-    for episode in range(EPISODE):
+    for episode in range(NUM_EPISODES):
         print("========== Episode {0} ==========".format(episode))
         observation = env.reset()
-        # Go `STEP` steps in every episode
-        for step in range(STEP):
+        # Go `NUM_STEPS_PER_EPISODE` steps in every episode
+        for step in range(NUM_STEPS_PER_EPISODE):
             # print("step: " + str(step))
             if train_display:
                 env.render()
@@ -40,17 +44,17 @@ def train_air_raid(train_display=False, test_display=True,
                 observation / 255.0, action, reward / 100.0, new_observation / 255.0, done
             )
             observation = new_observation
-            # If the game ends, stop training steps of this round immediately.
+            # If the game ends, stop training steps of this episode immediately.
             if done:
                 break
 
-        # Test `TEST_NUM` times for every `TEST_STEP` episodes
-        if episode > 0 and episode % TEST_STEP == 0:
+        # Test `NUM_TESTS_PER_TEST_ROUND` times for every `NUM_EPISODES_FOR_NEXT_TEST_ROUND` episodes
+        if episode > 0 and episode % NUM_EPISODES_FOR_NEXT_TEST_ROUND == 0:
             total_reward = 0.0
-            for i in range(TEST_NUM):
-                print("[TEST] Test round: " + str(i))
+            for i in range(NUM_TESTS_PER_TEST_ROUND):
+                print("[TEST] Test: " + str(i))
                 observation = env.reset()
-                for j in range(STEP):
+                for j in range(NUM_STEPS_PER_EPISODE):
                     # print("step: " + str(j))
                     if test_display:
                         env.render()
@@ -59,8 +63,8 @@ def train_air_raid(train_display=False, test_display=True,
                     total_reward += reward
                     if done:
                         break
-            aver_reward = total_reward / TEST_NUM
-            print('[TEST] Episode: {0} Evaluation average reward: {1}'
+            aver_reward = total_reward / NUM_TESTS_PER_TEST_ROUND
+            print('[TEST] After Episode {0}, evaluation average reward: {1}'
                   .format(episode, aver_reward))
 
             if record_test:
@@ -79,6 +83,7 @@ def train_air_raid(train_display=False, test_display=True,
 
 
 def play_air_raid(test_display=False):
+    PLAY_GAMES = 100
     import time
     time_str = time.strftime("%Y%m%d_%H%M%S")
 
@@ -96,7 +101,7 @@ def play_air_raid(test_display=False):
     brain.initialize_network()
 
     total_reward = 0.0
-    for i in range(PLAY_STEP):
+    for i in range(PLAY_GAMES):
         observation = env.reset()
         done = False
         print(i)
@@ -106,9 +111,9 @@ def play_air_raid(test_display=False):
             action = brain.action(observation / 255.0)
             observation, reward, done, _ = env.step(action)
             total_reward += reward
-    aver_reward = total_reward / PLAY_STEP
-    print('Average reward in {0} rounds: {1}'
-          .format(PLAY_STEP, aver_reward))
+    aver_reward = total_reward / PLAY_GAMES
+    print('Average reward in {0} games: {1}'
+          .format(PLAY_GAMES, aver_reward))
 
     env.close()
 
