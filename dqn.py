@@ -1,448 +1,634 @@
-from __future__ import print_function
-import random
-
-import tensorflow as tf
-import numpy as np
 import os
+import random
+import time
+import typing
 
-from collections import deque
+import numpy as np
+import tensorflow as tf
 
-INITIAL_EPSILON = 0.5
-FINAL_EPSILON = 0.01
-REPLAY_SIZE = 320
-BATCH_SIZE = 64
-GAMMA = 0.9
+from defaults import (BATCH_SIZE, REPLAY_CAPACITY, TIME_STEPS_PER_TRAIN,
+                      TRAIN_STEPS_PER_Q_SYNC)
+from replaymemory import FrameTransition, ReplayMemory
 
-SAVE_STEP = 1000  # Auto save once after training if time_step % SAVE_STEP == 0.
-TRAIN_STEP = 100  # Train once after perceiving if time_step % TRAIN_STEP == 0.
+Shape2DLike = typing.Union[int, typing.Tuple[int, int]]
+
+LayerType = typing.TypeVar("LayerType", bound=tf.keras.layers.Layer)
 
 
-class DQNBrain:
+class LayerConfig(object):
+    def __init__(
+        self,
+        layer_type: typing.Type[LayerType],
+        config: typing.Mapping[str, typing.Any]
+    ):
+        self.layer_type = layer_type
+        self.config = config
+
+
+def create_q_model(
+    state_shape: typing.Tuple[int, ...],
+    layer_configs: typing.Iterable[LayerConfig],
+    is_target_network=False,
+    name=None,
+    **kwargs
+) -> tf.keras.Model:
     """
-    A DQN network with two convolution layers and two fully connected layers.
+    Create the `tf.keras.Model` of a Q network.
+
+    :param state_shape:
+        The shape of each input state.
+    :param layer_configs:
+        Configs of model layers, which are listed in order.
+        Note that the last layer must be a 1D layer, whose length defines 
+        the dimension of action space.
+    :param is_target_network:
+        Tells whether this Q network is the trainable model or the target
+        model of the DQN algorithm.
+    :param name:
+        Name of this network, used to create scope for network parameters.
+    :param kwargs:
+        Other keyword arguments that will be passed into the initializer of
+        the `tf.keras.Model` class.
+
+    :return:
+        The created model (which is not compiled).
+
+    """
+
+    kwargs["trainable"] = (False if is_target_network else True)
+    if name is None:
+        name = "QNetwork" + ("-target" if is_target_network else "")
+    kwargs["name"] = name
+
+    inputs = tf.keras.layers.Input(shape=state_shape)
+    x = inputs
+    for layer_config in layer_configs:
+        _layer = layer_config.layer_type(**layer_config.config)
+        x = _layer(x)
+    outputs = x
+    model = tf.keras.Model(inputs=inputs, outputs=outputs, **kwargs)
+    return model
+
+
+class DQN(object):
+    """
+    A deep Q network class.
 
     To use this network, please follow the steps:
 
-    1. initialize DQNBrain
-    brain = DQNBrain(env, 4)  # , [8, 4], [16, 32], 256, 4)
-    
-    2. add network layers
-    brain.add_conv("conv1", 4, 16, pooling=True)
-    brain.add_conv("conv2", 4, 32, pooling=True)
-    brain.add_fc("fc1", 256)
-    brain.add_fc("q_layer", -1, output_layer=True)
+    1. initialize DQN with algorithm hyperparameters and configurations of 
+    convolution layers and fully connected layers (which define the structure
+    of the network).
 
-    These will set the network made up of some convolution layers firstly and 
-    then fully connected layers. Note that the last layer added must be a fully
-    connected layer whose boolean flag `output_layer` must be True, in which 
-    case `num_nodes` will be set by `add_fc` (and therefore you can use any 
-    value).
+    2. use `perceive` to make the network add state transition into the replay
+    memory and train parameters if needed.
 
-    3. initialize Q network
-    brain.initialize_network()
+    3. call `select_action_from_frame` to use the network to choose the next 
+    action according to current frame.
 
     """
 
-    def __init__(self, env, pooling_scale, record=False,
-                 save_path='saved_networks', record_path="records"):
+    INITIAL_EPSILON = 0.5
+    FINAL_EPSILON = 0.01
+    GAMMA = 0.9
+
+    def __init__(self,
+                 pframe_shape: typing.Tuple[int, ...],
+                 layer_configs: typing.Union[
+                     typing.List[LayerConfig], None
+                 ] = None,
+                 load_save_path: typing.Optional[str] = None,
+                 custom_objects: typing.Optional[typing.Mapping[str, typing.Any]] = None,
+                 frame_preprocessor: typing.Callable = lambda x: x,
+                 loss: tf.keras.losses.Loss = tf.keras.losses.mse,
+                 optimizer: tf.optimizers.Optimizer = tf.keras.optimizers.RMSprop(),
+                 replay_capacity: int = REPLAY_CAPACITY,
+                 hist_len: int = 1,
+                 hist_type: str = "linear",
+                 hist_spacing: int = 1,
+                 max_sample_attempts: int = 1000,
+                 batch_size: int = BATCH_SIZE,
+                 time_steps_per_train: int = TIME_STEPS_PER_TRAIN,
+                 train_steps_per_q_sync: int = TRAIN_STEPS_PER_Q_SYNC,
+                 pframe_dtype=np.float32):
         """
-        Initializes the DQN network.
-        
-        :param env: OpenAI Gym env
-            Gives the game environment. The shape of the observation space of
-            `env` must be a 3-tuple, e.g. (width of the image, height of the
-            image, number of channels).
-        :param pooling_scale: int
-            Gives the pooling scale in the max_pool steps (if any).
-        :param record: boolean
-            Tells the network whether the costs is needed to be recorded.
-        :param save_path: str
-            Gives the path where the network is supposed to be reloaded from 
-            and saved to.
-        :param record_path: str
-            Gives the path where the cost values are supposed to be recorded.
+        Initializes the DQN algorithm.
+
+        :param pframe_shape:
+            The shape of input preprocessed frame.
+            For example, if each frame is a preprocessed 3-channel image, then 
+            the shape is (width, height, 3).
+        :param layer_configs:
+            Configurations of layers.
+            Note that the output dimension of the last layer defines the dimension
+            of action space, i.e. number of actions in the game.
+            If being None, the models will be loaded from `load_save_path`.
+            See the explanation of `load_save_path`.
+        :param load_save_path:
+            If not None, the models will be loaded from `load_save_path`.
+            Note that arguments `layer_configs` and `load_save_path` are related
+            as:
+                if load_save_path is not None:
+                    layer_configs can be None and will be ignored;
+                    q_model (and the optimizer and loss function) and
+                    q_model_target are loaded from load_save_path. 
+                if load_save_path is None:
+                    layer_configs cannot be None;
+                    q_model and q_model_target are created according to 
+                    layer_configs.
+        :param custom_objects:
+            Optional dictionary mapping names (strings) to custom classes or 
+            functions (like custom Layer classes or loss functions) to be 
+            considered during deserialization.
+            Only works when `load_save_path` is not None.
+        :param frame_preprocessor:
+            A function that can preprocess the frame yielded from `env`.
+            For example, this callable may convert the image from RGB
+            representation to gray-scale representation, and then down-sample
+            it.
+        :param loss:
+            The loss function for model training.
+            It will be overridden if the models are loaded from `load_save_path`.
+        :param optimizer:
+            The optimizer for model training.
+            It will be overridden if the models are loaded from `load_save_path`.
+        :param replay_capacity:
+            The capacity (i.e. max size) of the replay memory.
+        :param hist_len:
+        :param hist_type:
+        :param hist_spacing:
+        :param max_sample_attempts:
+            Parameters for constructing replay memory. Please refer to 
+            the docstring of `ReplayMemory`.
+        :param batch_size:
+            The size of batches used in `self.train`.
+        :param time_steps_per_train:
+            Train once after perceiving if time_step % time_steps_per_train == 0.
+        :param train_steps_per_q_sync:
+            Synchronize the weights of the target Q model using the weights of 
+            the trainable Q model after training if
+                train_step % train_steps_per_q_sync == 0.
+        :param pframe_dtype:
+            The data type of preprocessed frames in the replay memory and
+            hence the data type of input data of Q model in the algorithm.
 
         """
-        # init replay memory
-        self.replay_memory = deque()
+        # configs for constructing the network
+        self.pframe_shape = pframe_shape
 
-        # hyper parameters for DQN algorithm
+        # components for compiling the models
+        self.loss = loss
+        self.optimizer = optimizer
+
+        # initialize replay memory
+        # state --action--> reward, done, next_state
+        self.pframe_dtype = pframe_dtype
+        self.replay_memory = ReplayMemory(
+            frame_shape=self.pframe_shape,
+            capacity=replay_capacity,
+            hist_len=hist_len,
+            hist_type=hist_type,
+            hist_spacing=hist_spacing,
+            max_sample_attempts=max_sample_attempts,
+            dtype=self.pframe_dtype
+        )
+
+        # initialize and compile the models
+        self.q_model: typing.Optional[tf.keras.models.Model] = None
+        self.q_model_target: typing.Optional[tf.keras.models.Model] = None
+        self.action_dim = None
+        if load_save_path is not None:
+            self.load_model(load_save_path, custom_objects=custom_objects)
+        elif layer_configs is not None:
+            self.initialize_model(layer_configs)
+        else:
+            raise ValueError(
+                "`layer_configs` and `load_save_path` cannot be both None."
+            )
+
+        # hyperparameters for DQN algorithm
         self.time_step = 0
         self.train_step = 0
-        self.epsilon = INITIAL_EPSILON
-        self.pooling_scale = pooling_scale
+        self.epsilon = self.INITIAL_EPSILON  # a float in [0, 1)
 
-        # env-related parameters
-        self.state_dim = env.observation_space.shape
-        self.action_dim = env.action_space.n
+        # env-frame preprocessor
+        self._frame_preprocessor = frame_preprocessor
 
-        # layers
-        self.state_input = None
-        self.q_value = None
+        self.batch_size = batch_size
+        self.time_steps_per_train = time_steps_per_train
+        self.train_steps_per_q_sync = train_steps_per_q_sync
 
-        # other attributes in the network
-        self.cost = None
-        self.optimizer = None
-        self.y = None
-        self.action_input = None
+        # caches for current preprocessed frame
+        # if it is not None, it must correspond to a non-terminal frame
+        # (refer to self.perceive)
+        self.current_pframe = None
 
-        # DEBUGGER
-        self.hidden_record = None
-        self.fc1_record = None
+        self.loss_history: typing.List[typing.Tuple[int, float]] = []
 
-        # hyper parameters for the network
-        self.conv_config = []  # list of dict
-        self.fc_config = []  # list of dict
-        self.conv_weights = []
-        self.conv_biases = []
-        self.fc_weigths = []
-        self.fc_biases = []
+    def _check_action_dim(self):
+        output_shape = self.q_model.output_shape[1:]
+        if len(output_shape) != 1:
+            raise ValueError(
+                f"The output layer is not 1-D, whose shape is {output_shape} "
+                "(batch dimension not included)"
+            )
 
-        # cheat parameters:
-        # The last conv layer's shape (width, height, depth);
-        # batch_size is not included here
-        self.last_conv_layer_shape = np.array(self.state_dim)
-        self.output_layer_implemented = False
+        if self.action_dim is None:
+            self.action_dim = output_shape[0]
+        elif self.action_dim != output_shape[0]:
+            raise ValueError(
+                f"The output shape of q_model ({output_shape}) does not match "
+                f"`action_dim` ({self.action_dim})"
+            )
 
-        self.session = None
-        self.saver = None
+    def initialize_model(self, layer_configs):
+        """
+        Initializes the networks.
 
+        """
+        self.q_model = create_q_model(
+            state_shape=(self.replay_memory.hist_len, *self.pframe_shape),
+            layer_configs=layer_configs,
+            is_target_network=False,
+            name="q-model"
+        )
+        self.q_model_target = create_q_model(
+            state_shape=(self.replay_memory.hist_len, *self.pframe_shape),
+            layer_configs=layer_configs,
+            is_target_network=True,
+            name="q-model-target"
+        )
+
+        # # connect all layers in `q_model` so that its `output_shape` can be
+        # # accessed
+        # self.q_model(tf.keras.layers.Input(self.pframe_shape))
+
+        self.q_model.compile(
+            optimizer=self.optimizer,
+            loss=self.loss
+        )
+
+        self._check_action_dim()
+
+    def load_model(
+        self,
+        save_path: str,
+        custom_objects: typing.Optional[typing.Mapping[str, typing.Any]] = None
+    ):
+        """
+        Load a saved model.
+
+        In order to load a saved model, initialize the `DQN` class as usual
+        (since some properties need to be defined through `__init__`), and
+        then call this method, i.e.
+        ```
+        network = DQN(...)
+        network.load_model(save_path, custom_objects={})
+        ```
+        or designating the save_path directly in `__init__`:
+        ```
+        network = DQN(load_save_path=save_path, ...)
+        ```
+        After this the models of `network` (`q_model` and `q_model_target`)
+        are restored.
+
+        :param save_path:
+            The path to the directory where the model and the history of 
+            loss values are saved.
+            Its contents should be:
+                save_path/ ─┬─ model
+                            └─ loss_values
+
+        :param custom_objects:
+             Optional dictionary mapping names (strings) to custom classes or 
+             functions (like custom Layer classes or loss functions) to be 
+             considered during deserialization.
+
+        """
+        if not save_path.endswith(os.path.sep):
+            save_path += os.path.sep
+        model_path = save_path + "model"
+
+        self.q_model = tf.keras.models.load_model(
+            model_path, custom_objects=custom_objects, compile=True
+        )
+        self.q_model.trainable = True
+
+        self.q_model_target = tf.keras.models.load_model(
+            model_path, custom_objects=custom_objects, compile=False
+        )
+        self.q_model_target.trainable = False
+
+        self._check_action_dim()
+
+    def save(self, save_path='training_savings'):
+        """
+        Save the model (including its architecture, weights and the state of 
+        the optimizer).
+
+        :param save_path: str
+            The path to the directory where the model and the history of 
+            loss values are saved.
+            If not existed, the directory will be created, and its contents
+            will be:
+                save_path/ ─┬─ model
+                            └─ loss_records.npz
+
+        """
         if not save_path.endswith(os.sep):
             save_path += os.sep
-        self.save_path = save_path
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+        model_path = save_path + "model"
+        loss_records_path = save_path + "loss_records.npz"
 
-        if not record_path.endswith(os.sep):
-            record_path += os.sep
-        self.record_path = record_path
+        # save the Q model
+        self.q_model.save(model_path, save_format="h5")
 
-        self.record = record
-
-    def define_inputs(self):
-        with tf.name_scope('inputs'):
-            self.state_input = \
-                tf.placeholder('float', [None] + list(self.state_dim))
-
-    def add_conv(self, name, patch_size, depth, activation="sigmoid", pooling=False):
-        in_depth = self.state_dim[-1] if len(self.conv_config) == 0 \
-            else self.conv_config[-1]['out_depth']
-        self.conv_config.append({
-            'patch_size': patch_size,
-            'in_depth': in_depth,
-            'out_depth': depth,
-            'activation': activation,
-            'pooling': pooling,
-            'name': name
-        })
-        self.last_conv_layer_shape[-1] = depth
-        if pooling is True:
-            old_shape = self.last_conv_layer_shape
-            scale = np.array([self.pooling_scale, self.pooling_scale, 1])
-            self.last_conv_layer_shape = \
-                np.ceil(1.0 * old_shape / scale).astype(int)
-        with tf.name_scope(name):
-            weights = self.weight_variable(
-                [patch_size, patch_size, in_depth, depth], name
-            )
-            biases = self.bias_variable([depth], name)
-            self.conv_weights.append(weights)
-            self.conv_biases.append(biases)
-
-    def add_fc(self, name, num_nodes, activation="sigmoid", output_layer=False):
-        if self.output_layer_implemented:
-            print("The output layer has been implemented. "
-                  "This layer will be ignored.")
-            return
-
-        # set num_nodes
-        if output_layer is True:
-            num_nodes = self.action_dim
-            self.output_layer_implemented = True
-
-        # set in_num_nodes
-        in_num_nodes = \
-            np.prod(self.last_conv_layer_shape) if len(self.fc_config) == 0 \
-                else self.fc_config[-1]['out_num_nodes']
-
-        self.fc_config.append({
-            'in_num_nodes': in_num_nodes,
-            'out_num_nodes': num_nodes,
-            'activation': activation,
-            'name': name,
-            'output_layer': output_layer
-        })
-        with tf.name_scope(name):
-            weights = self.weight_variable([in_num_nodes, num_nodes], name)
-            biases = self.bias_variable([num_nodes], name)
-            self.fc_weigths.append(weights)
-            self.fc_biases.append(biases)
-            # self.train_summaries.append(tf.histogram_summary(str(len(self.fc_weights)) + '_weights', weights))
-            # self.train_summaries.append(tf.histogram_summary(str(len(self.fc_biases)) + '_biases', biases))
-
-    def create_q_network(self):
-        """
-        Define variables in the network.
-
-        """
-
-        # ------------- hidden layers -------------
-        def calculate_q_layer(data):
-            """
-            Calculates those hidden layers, and returns the Q layer.
-
-            """
-            # -------------------- convolution layers ---------------------
-            for i, (weights, biases, config) in enumerate(
-                    zip(self.conv_weights, self.conv_biases, self.conv_config)
-            ):
-                with tf.name_scope(config['name'] + '_model'):
-                    with tf.name_scope('convolution'):
-                        data = tf.nn.conv2d(
-                            data, filter=weights, strides=[1, 1, 1, 1],
-                            padding='SAME'
-                        )
-                        data = data + biases
-
-                if config['activation'] == 'sigmoid':
-                    data = tf.nn.sigmoid(data)
-                elif config['activation'] is None:
-                    pass
-                else:
-                    print('Activation function can only be sigmoid or relu now.')
-                    data = tf.nn.relu(data)
-
-                if config['pooling']:
-                    data = self.max_pool_nxn(data, self.pooling_scale)
-
-            # ------------------ fully connected layers -------------------
-            for i, (weights, biases, config) in enumerate(
-                    zip(self.fc_weigths, self.fc_biases, self.fc_config)
-            ):
-                print(weights)
-                if i == 0:
-                    shape = data.get_shape().as_list()
-                    data = tf.reshape(data, [-1, np.prod(shape[1:])])
-
-                with tf.name_scope(config['name'] + 'model'):
-                    data = tf.matmul(data, weights) + biases
-
-                    if config['activation'] == 'sigmoid':
-                        data = tf.nn.sigmoid(data)
-                    elif config['activation'] == None:
-                        pass
-                    else:
-                        print('Activation function can only be sigmoid or relu now.')
-                        data = tf.nn.relu(data)
-
-            # ----------- last fully connected layer (Q layer) ------------
-            # return.shape = [batch_size, action_dim]
-            return data
-
-        # Q value layer
-        # shape =  [batch_size, action_dim]
-        self.q_value = calculate_q_layer(self.state_input)
-
-    def create_training_method(self):
-        self.action_input = tf.placeholder('float', [None, self.action_dim])
-        self.y = tf.placeholder('float', [None])
-        q_action = tf.reduce_sum(tf.multiply(self.q_value, self.action_input), axis=1)
-
-        with tf.name_scope('loss'):
-            self.cost = tf.reduce_mean(tf.square(self.y - q_action))
-
-        with tf.name_scope('optimizer'):
-            self.optimizer = tf.train.GradientDescentOptimizer(0.0001).minimize(self.cost)
-
-    def initialize_network(self):
-        """
-        Initializes the network. Only being called after all layers implemented
-        is allowed.
-
-        """
-        if self.output_layer_implemented is False:
-            raise Exception("The output layer is not implemented yet!")
-
-        self.define_inputs()
-
-        self.create_q_network()
-        self.create_training_method()
-
-        # init saver
-        self.saver = tf.train.Saver(tf.all_variables())
-
-        # init session
-        self.session = tf.InteractiveSession()
-
-        self.session.run(tf.global_variables_initializer())
-
-        # load checkpoints if there are any
-        checkpoint = tf.train.get_checkpoint_state(checkpoint_dir=self.save_path)
-        if checkpoint and checkpoint.model_checkpoint_path:
-            self.saver.restore(self.session, checkpoint.model_checkpoint_path)
-            print("[Load checkpoint] Successfully loaded: ", checkpoint.model_checkpoint_path)
+        # save the loss values
+        if os.path.exists(loss_records_path):
+            loss_npzfile = np.load(loss_records_path)
+            loss_records = dict(loss_npzfile)
         else:
-            print("[Load checkpoint] Could not find saved network weights. Start from scratch.")
+            loss_records = {}
+        loss_records[
+            f"loss_{time.strftime('%Y%m%d_%H%M%S')}"
+        ] = np.array(self.loss_history)
 
-    def perceive(self, state, action, reward, next_state, done):
+        np.savez_compressed(
+            loss_records_path,
+            **loss_records,
+        )
+
+        # reset the loss history since the values have been stored
+        self.loss_history: typing.List[typing.Tuple[int, float]] = []
+
+    def preprocess_frame(
+        self,
+        frame
+    ) -> np.ndarray:
         """
-        Let the brain perceive the state transition relation:
+        Preprocess a frame yielded from the environment.
 
-            state --action--> reward, next_state, done
+        :param frame:
+            The input frame yielded from the environment, e.g. a 3-channel image
+            whose shape is (width, height, 3).
 
-        :param state:
-            Former state.
-        :param action: int
-            Action that yields `next_state` from `state`.
+        :return:
+            The preprocessed frame `pframe`.
+
+        """
+        pframe = self._frame_preprocessor(frame)
+        return pframe
+
+    def perceive(
+        self,
+        frame,
+        action: int,
+        reward: float,
+        done: bool,
+        next_frame
+    ):
+        """
+        Makes the Q networks perceive the transition relation:
+
+            frame --action--> reward, done, next_frame
+
+        i.e. stores (pframe, action, reward, done, next_pframe) into
+        `self.replay_memory` (where pframe = preprocessed frame) and
+        trains `q_model` if there are enough records in `self.replay_memory`.
+
+        :param frame:
+            Current frame generated from the environment.
+        :param action:
+            Action that yields `next_frame` from `frame`.
         :param reward:
             Reward of the action.
-        :param next_state:
-            Next state.
         :param done:
-            Tells whether `next_state` is a terminal state.
+            Tells whether `next_frame` is a terminal frame.
+        :param next_frame:
+            Next frame.
 
         """
         self.time_step += 1
 
-        one_hot_action = np.zeros(self.action_dim)
-        one_hot_action[action] = 1
-        self.replay_memory.append(
-            (state, one_hot_action, reward, next_state, done)
+        if self.current_pframe is not None:
+            # Directly use cached pframe since the transition is continuous,
+            # i.e. self.current_pframe == self.preprocess_frame(frame)
+            pframe = self.current_pframe
+        else:
+            # No cache available (the game just (re)started)
+            pframe = self.preprocess_frame(frame)
+
+        if not done:
+            # Cache next_pframe as current pframe
+            self.current_pframe = self.preprocess_frame(next_frame)
+        else:
+            # The game terminates, and clear cache
+            self.current_pframe = None
+
+        self.replay_memory.add(
+            FrameTransition(pframe, action, reward, done)
         )
 
-        if len(self.replay_memory) > REPLAY_SIZE:
-            self.replay_memory.popleft()
+        if (len(self.replay_memory.sampleable_range()) > self.batch_size
+                and self.time_step % self.time_steps_per_train == 0):
+            self.train()
 
-        if len(self.replay_memory) > BATCH_SIZE and self.time_step % TRAIN_STEP == 0:
-            self.train_q_network()
+    @staticmethod
+    def calculate_y(
+        reward_batch: np.ndarray,
+        next_q_value_batch: np.ndarray,
+        is_next_state_done_batch: np.ndarray,
+        gamma: float
+    ) -> np.ndarray:
+        """
+        Calculate y_j according to the formula:
 
-    def train_q_network(self):
-        print("[Training round {0}] ready to train...".format(self.train_step))
+            y_j = r_j                                 for terminal φ_{j+1};
+                  r_j + γ max_a { Q(φ_{j+1}, a) }     for non-terminal φ_{j+1},
 
-        # Step 1: obtain random minibatch from replay memory
-        minibatch = random.sample(self.replay_memory, BATCH_SIZE)
-        state_batch = [data[0] for data in minibatch]
-        action_batch = [data[1] for data in minibatch]
-        reward_batch = [data[2] for data in minibatch]
-        next_state_batch = [data[3] for data in minibatch]
+        where "max_a {f}" means calculating the maximal value of f over all a
+        values.
+
+        :param reward_batch:
+            Batch of rewards (shape=(batch_size,)).
+        :param next_q_value_batch:
+            Q values of next step, which should be evaluated using the **target
+            Q model**.
+            Note that only for the case where φ_{j+1} is non-terminal there is
+            a valid Q(φ_{j+1}, a) value, therefore the shape of this argument is
+            (num_not_done_cases_in_batch, action_dim).
+        :param is_next_state_done_batch:
+            Batch of booleans which tell whether φ_{j+1} is a terminal step
+            (i.e. done) or not (shape=(batch_size,)).
+            Note that
+                len(np.where(logical_not(is_next_state_done_batch))[0])
+                == num_not_done_cases_in_batch.
+        :param gamma:
+            Discounting factor of future rewards.
+
+        """
+        y_batch = reward_batch
+        y_batch[np.logical_not(is_next_state_done_batch)] += (
+            # for next_state not done:
+            gamma * np.max(next_q_value_batch, axis=-1)
+        )  # shape=(num_not_done_cases_in_batch,)
+        return y_batch  # shape=(batch_size,)
+
+    def train(self):
+        print(
+            "[ Training round {0:03d} ] ready to train..."
+            .format(self.train_step)
+        )
+
+        # Step 1: generate random minibatch from replay memory
+        (
+            state_batch,  # shape=(batch_size, state_shape)
+            action_batch,  # shape=(batch_size,)
+            reward_batch,  # shape=(batch_size,)
+            done_batch,  # shape=(batch_size,)
+            next_state_batch  # shape=(batch_size, state_shape)
+        ) = self.replay_memory.sample(self.batch_size)
 
         # Step 2: calculate y
-        y_batch = []
-        next_q_value_batch = self.q_value.eval(
-            feed_dict={self.state_input: next_state_batch}
-        )
-        for i in range(BATCH_SIZE):
-            done = minibatch[i][4]
-            if done:
-                y_batch.append(reward_batch[i])
-            else:
-                y_batch.append(reward_batch[i] +
-                               GAMMA * np.max(next_q_value_batch[i]))
+        next_q_value_batch: np.ndarray = self.q_model_target(
+            next_state_batch[np.logical_not(done_batch)],
+            training=False
+        )  # shape=(num_not_done_cases, action_dim)
+        y_batch = self.calculate_y(
+            reward_batch,
+            next_q_value_batch,
+            done_batch,
+            self.GAMMA
+        )  # shape=(batch_size,)
 
-        self.optimizer.run(
-            feed_dict={
-                self.y: y_batch,
-                self.action_input: action_batch,
-                self.state_input: state_batch
-            }
+        # Since the output of `q_model` has a dimension of (batch_size, action_dim),
+        # which does not match the dimension of `y_batch`, we should extend
+        # `y_batch` so that the loss function can evaluates:
+        #   loss(
+        #       y_batch, q_model(state_batch)[np.arange(0, batch_size), action_batch]
+        #   )
+        y_batch_extended = tf.tensor_scatter_nd_update(
+            self.q_model(
+                state_batch,
+                training=False
+            ),
+            tf.where(
+                tf.one_hot(action_batch, depth=self.action_dim)
+            ),  # shape=(batch_size, action_dim)
+            y_batch
         )
-        cost_print = self.cost.eval(
-            feed_dict={
-                self.y: y_batch,
-                self.action_input: action_batch,
-                self.state_input: state_batch
-            }
+
+        loss_value = self.q_model.train_on_batch(
+            x=state_batch,
+            y=y_batch_extended
         )
-        # conv1_w_print = self.conv1_weights.eval(
-        #     feed_dict={self.state_input: state_batch}
-        # )
-        # print("State batch: {0}".format(state_batch))
-        # print("Next q batch: {0}".format(next_q_value_batch))
-        # print("reward batch: {0}".format(reward_batch))
-        # print("y: {0}".format(y_batch))
-        # print("fc1_record: {0}".format(self.fc1_record.eval(
-        #     feed_dict={self.state_input: next_state_batch}
-        # )))
-        # print("hidden: {0}".format(self.hidden_record.eval(
-        #     feed_dict={self.state_input: next_state_batch}
-        # )))
-        # print("fc1_weights: {0}".format(self.session.run(
-        #     self.fc1_weights, 
-        #     feed_dict={self.state_input: next_state_batch}
-        # )))
-        print("network time step {0} | cost: "
-              .format(self.time_step), cost_print)
-
-        if self.record:
-            # save cost value
-            if not os.path.isdir(self.record_path):
-                os.makedirs(self.record_path)
-            record_file = self.record_path + "costs"
-            rf = open(record_file, "a")
-            try:
-                rf.write(str(cost_print) + "\n")
-            finally:
-                rf.close()
-
-        # auto-save
-        if self.time_step % SAVE_STEP == 0:
-            if os.path.isdir(self.save_path):
-                saved_filename = \
-                    self.saver.save(self.session, self.save_path + 'model.ckpt',
-                                    global_step=self.time_step)
-                print("[AUTO SAVE] Model saved in file: {0}"
-                      .format(saved_filename))
-            else:
-                os.makedirs(self.save_path.split('/')[0])
-                saved_filename = \
-                    self.saver.save(self.session, self.save_path + 'model.ckpt',
-                                    global_step=self.time_step)
-                print("[AUTO SAVE] Model saved in file: {0}"
-                      .format(saved_filename))
+        print(f"time step: {self.time_step: 3d}  loss: {loss_value:.4f}")
+        self.loss_history.append((self.time_step, loss_value))
 
         self.train_step += 1
 
-    def epsilon_greedy_action(self, state):
+        if self.train_step % self.train_steps_per_q_sync == 0:
+            for train_layer, target_layer in zip(
+                self.q_model.layers, self.q_model_target.layers
+            ):
+                target_layer.set_weights(train_layer.get_weights())
+            print("Target Q network parameters synchronized.")
+
+        if self.epsilon > self.FINAL_EPSILON:
+            self.epsilon -= (self.INITIAL_EPSILON -
+                             self.FINAL_EPSILON) / 10000.0
+
+    def evaluate(self):
+        # Step 1: generate random minibatch from replay memory
+        (
+            state_batch,  # shape=(batch_size, state_shape)
+            action_batch,  # shape=(batch_size,)
+            reward_batch,  # shape=(batch_size,)
+            done_batch,  # shape=(batch_size,)
+            next_state_batch  # shape=(batch_size, state_shape)
+        ) = self.replay_memory.sample(self.batch_size)
+
+        # Step 2: calculate y
+        next_q_value_batch: np.ndarray = self.q_model_target(
+            next_state_batch[np.logical_not(done_batch)],
+            training=False
+        )  # shape=(num_not_done_cases, action_dim)
+        y_batch = self.calculate_y(
+            reward_batch,
+            next_q_value_batch,
+            done_batch,
+            self.GAMMA
+        )  # shape=(batch_size,)
+
+        # Since the output of `q_model` has a dimension of (batch_size, action_dim),
+        # which does not match the dimension of `y_batch`, we should extend
+        # `y_batch` so that the loss function can evaluates:
+        #   loss(
+        #       y_batch, q_model(state_batch)[np.arange(0, batch_size), action_batch]
+        #   )
+        y_batch_extended = tf.tensor_scatter_nd_update(
+            self.q_model(
+                state_batch,
+                training=False
+            ),
+            tf.where(
+                tf.one_hot(action_batch, depth=self.action_dim)
+            ),  # shape=(batch_size, action_dim)
+            y_batch
+        )
+
+        evaluated_loss_value = self.q_model.evaluate(
+            x=state_batch,
+            y=y_batch_extended,
+            batch_size=self.batch_size,
+            verbose=0
+        )
+
+        return evaluated_loss_value
+
+    def select_action(self, state):
         """
-        Given current state, selects the next action.
-        
+        Given current state, selects the next action according to ε-greedy
+        strategy, i.e. with probablity ε selects a random action from the
+        action space, otherwise selects the action as argmax_a{Q(state, a)},
+        where Q is the **(trainable) Q model**.
+
         :param state:
             Current state. Note that the state here is actually a single 
-            observation of self.env, not a batch of states.
+            observation of environment, not a batch of states.
+
         :return: 
             Next action.
 
         """
-        # Here batch_size = 1, so self.q_value.eval(...).shape =
-        # [1, action_dim].
-        q_value = self.q_value.eval(
-            feed_dict={self.state_input: [state]}
-        )[0]  # it would be OK if there is no "[0]".
-
         if random.random() <= self.epsilon:
             action = random.randint(0, self.action_dim - 1)
         else:
+            # Here batch_size = 1, so self.q_value_layer(state).shape =
+            # [1, action_dim].
+            q_value = self.q_model(
+                np.expand_dims(state, 0)
+            ).numpy()[0]  # shape=(action_dim,)
             action = np.argmax(q_value)
-
-        if self.epsilon > FINAL_EPSILON:
-            self.epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / 10000.0
 
         return action
 
-    def action(self, state):
-        return np.argmax(self.q_value.eval(
-            feed_dict={self.state_input: [state]}
-        ))
+    def select_action_from_frame(self, current_frame):
+        """
+        Given current frame, selects the next action according to ε-greedy
+        strategy.
 
-    @staticmethod
-    def weight_variable(shape, name):
-        initial = tf.truncated_normal(shape, stddev=0.5)
-        return tf.Variable(initial, name=name + '_weights')
+        :param current_frame:
+            Current frame, which is not preprocessed and not added in the 
+            replay memory yet.
 
-    @staticmethod
-    def bias_variable(shape, name):
-        initial = tf.constant(0.01, shape=shape)
-        return tf.Variable(initial, name=name + '_biases')
+        :return:
+            Next action.
 
-    @staticmethod
-    def max_pool_nxn(data, n):
-        return tf.nn.max_pool(data, ksize=[1, n, n, 1],
-                              strides=[1, n, n, 1], padding="SAME")
+        """
+        current_state = self.replay_memory.construct_current_state(
+            self.preprocess_frame(current_frame)
+        )
+        return self.select_action(current_state)
