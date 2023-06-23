@@ -1,7 +1,10 @@
 import sys
 import typing
 
-import gym
+try:
+    import gymnasium as gym
+except:
+    import gym
 
 if sys.version_info >= (3, 8):
     @typing.runtime_checkable

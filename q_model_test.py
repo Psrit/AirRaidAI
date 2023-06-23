@@ -78,8 +78,8 @@ class CreatQModelTest(unittest.TestCase):
             np.all(
                 np.array_equal(w1, w2)
                 for w1, w2 in zip(
-                    self.q_model.optimizer.get_weights(),
-                    reconstructed_q_model.optimizer.get_weights()
+                    self.q_model.optimizer.variables,
+                    reconstructed_q_model.optimizer.variables
                 )
             )
         )

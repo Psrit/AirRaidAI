@@ -1,66 +1,61 @@
+import os
+import sys
+
 import matplotlib.pyplot as plt
 import numpy as np
-import os, sys
 
-record_dir = 'records/'
-costs_filename = record_dir + 'costs'
-rewards_filename = record_dir + 'test_rewards'
 
-# check record_dir
-if not os.path.isdir(record_dir):
-    print("No records directory found.")
-    sys.exit()
+def plot_records(record_dir: str, save: bool = False):
+    loss_records_filename = os.path.join(record_dir, 'loss_records.npz')
 
-# plot costs curve
-if not os.path.isfile(costs_filename):
-    print("No cost record found.")
-else:
-    cost_values = []
-    fc = open(costs_filename, 'r')
-    try:
-        lines = fc.readlines()
-        for l in lines:
-            l = l.strip()
-            try:
-                l = float(l)
-                cost_values.append(l)
-            except:
-                # Note here!
-                break
+    # check record_dir
+    if not os.path.isdir(record_dir):
+        print("No records directory found.")
+        sys.exit()
 
-        cost_values = np.array(cost_values)
+    # plot costs curve
+    loss_records = np.load(loss_records_filename)
 
-        fig = plt.figure()
-        plt.plot(cost_values)
-        plt.xlabel("Training round")
-        plt.ylabel("Cost")
-        fig.savefig(record_dir + "cost_curve.pdf")
-    finally:
-        fc.close()
+    train_steps = []  # see line 343 of dqn.py, starting from 0 in each record of `loss_records`
+    loss_values = []
+    for k, v in sorted(loss_records.items(), key=lambda kwpair: kwpair[0]):
+        print(k)
+        if len(train_steps):  # not empty
+            train_steps = np.append(
+                train_steps,
+                v[:, 0] - v[0, 0] + train_steps[-1] + 1
+            )
+        else:
+            train_steps = v[:, 0]
+        loss_values = np.append(loss_values, v[:, 1])
 
-# plot rewards curve
-if not os.path.isfile(rewards_filename):
-    print("No reward record found.")
-else:
-    reward_values = []
-    fr = open(rewards_filename, 'r')
-    try:
-        lines = fr.readlines()
-        for l in lines:
-            l = l.strip()
-            try:
-                l = float(l)
-                reward_values.append(l)
-            except:
-                # Note here!
-                continue
+    print(train_steps)
 
-        reward_values = np.array(reward_values)
+    ma_len = min(50, len(train_steps))
+    moving_avg = np.zeros(len(train_steps) - ma_len + 1)
+    moving_std = np.zeros(len(train_steps) - ma_len + 1)
+    for i in range(0, len(train_steps) - ma_len + 1):
+        moving_avg[i] = np.mean(loss_values[i:i + ma_len])
+        moving_std[i] = np.std(loss_values[i:i + ma_len], ddof=1)
 
-        fig = plt.figure()
-        plt.plot(reward_values)
-        plt.xlabel("Test round")
-        plt.ylabel("Average reward")
-        fig.savefig(record_dir + "reward_curve.pdf")
-    finally:
-        fr.close()
+    fig, axes = plt.subplots()
+    axes.scatter(train_steps, loss_values, s=0.6)
+    axes.plot(
+        train_steps[ma_len - 1:],
+        moving_avg,
+        color="orange",
+        label=f"simple moving average (ma_len={ma_len})"
+    )
+    axes.fill_between(
+        train_steps[ma_len - 1:],
+        moving_avg - moving_std,
+        moving_avg + moving_std,
+        facecolor="orange",
+        alpha=0.3
+    )
+    axes.set_xlabel("Training step")
+    axes.set_ylabel("Loss")
+    axes.legend()
+
+    if save:
+        fig.savefig(os.path.join(record_dir, "loss_plot.pdf"))

@@ -8,7 +8,7 @@ from tensorflow.keras.layers import Conv2D, Dense, Flatten
 
 from dqn import DQN, LayerConfig
 
-frame_shape = (250, 160, 3)
+state_shape = (250, 160, 3)
 action_dim = 5
 
 layer_configs = [
@@ -43,52 +43,64 @@ layer_configs = [
 
 class DQNTest(unittest.TestCase):
     def test_output_dim(self):
-        network = DQN(frame_shape, layer_configs,
-                      frame_preprocessor=lambda x: x)
+        network = DQN(state_shape, layer_configs,
+                      reward_gamma=0.9, state_dtype=tf.float64)
         network.q_model.summary()
         self.assertEqual(network.action_dim, action_dim)
         self.assertEqual(network.q_model.output_shape, (None, action_dim))
 
     def test_save_and_load(self):
-        test_input = np.random.random((128, *frame_shape))
-        test_output = np.random.random((128, action_dim))
+        test_states = np.random.random((128, *state_shape)).astype(np.float32)
+        test_actions = np.random.randint(0, action_dim, (128,))
+        test_rewards = np.random.random((128,)).astype(np.float32)
+        test_dones = np.random.randint(0, 2, (128,)).astype(np.float32)
+        test_states_ = np.random.random((128, *state_shape)).astype(np.float32)
 
         save_path = "./q_model_save_test/"
         if os.path.exists(save_path):
             shutil.rmtree(save_path)
 
-        network = DQN(frame_shape, layer_configs,
-                      frame_preprocessor=lambda x: x)
-        history: tf.keras.callbacks.History = network.q_model.fit(
-            test_input, test_output
-        )  # only for test; in practice use `network.perceive` to train the model
-        network.loss_history += history.history["loss"]
+        # Create the original DQN instance and train two turns
+        network = DQN(state_shape, layer_configs, reward_gamma=0.9)
+        network.train(
+            b_state=test_states,
+            b_action=test_actions,
+            b_reward=test_rewards,
+            b_done=test_dones,
+            b_state_=test_states_
+        )
+        network.train(
+            b_state=test_states,
+            b_action=test_actions,
+            b_reward=test_rewards,
+            b_done=test_dones,
+            b_state_=test_states_
+        )
+        loss_history = network.loss_history
 
+        # Save the instance
         network.save(save_path)
 
+        # Loss records is saved correctly
         self.assertTrue(network.loss_history == [])
         self.assertTrue(
             np.array_equal(
-                history.history["loss"],
+                loss_history,
                 tuple(
                     v for v in np.load(save_path + "loss_records.npz").values()
                 )[0]
             )
         )
 
-        loaded_network = DQN(frame_shape, load_save_path=save_path,
-                             frame_preprocessor=lambda x: x)
+        # Load the instance
+        loaded_network = DQN(
+            state_shape, layer_configs=layer_configs
+        )
+        loaded_network.load(save_path)
 
-        self.assertTrue(loaded_network.q_model.optimizer is not None)
-        self.assertTrue(loaded_network.q_model.loss is not None)
-        self.assertTrue(loaded_network.q_model_target.optimizer is None)
-        with self.assertRaisesRegex(
-            AttributeError, "'Functional' object has no attribute 'loss'"
-        ):
-            _ = loaded_network.q_model_target.loss
-
-        self.assertTrue(len(loaded_network.q_model.trainable_weights) ==
-                        len(network.q_model.trainable_weights))
+        # Weights of Q models are equal
+        self.assertEqual(len(loaded_network.q_model.trainable_weights),
+                         len(network.q_model.trainable_weights))
         # Values of trainable weights in q_model of the original network and
         # the loaded network are equal. Note that the weights in q_model_target
         # of the original network have not been synchronized yet.
@@ -98,27 +110,59 @@ class DQNTest(unittest.TestCase):
         ):
             self.assertTrue(tf.reduce_all(_w1 == _w2))
 
+        # Loaded target Q model is not trainable
         self.assertTrue(
             len(loaded_network.q_model_target.trainable_weights)
             == 0
         )
 
-        # The reconstructed model is already compiled and has retained the
-        # optimizer state, so training can resume.
-        # Note that the following assertions will not hold if we replace
-        # `network.q_model` with `network.q_model_target` since the weights
-        # of `network.q_model_target` have not been synchronized yet.
+        # Optimizers are equal
+        self.assertEqual(network.optimizer, loaded_network.optimizer)
+        self.assertEqual(len(loaded_network.optimizer.variables()),
+                         len(network.optimizer.variables()))
+        for opvar, opvar_tar in zip(
+            network.optimizer.variables(), loaded_network.optimizer.variables()
+        ):
+            self.assertTrue(tf.reduce_all(opvar == opvar_tar))
+
+        # Hyperparameters are equal
+        self.assertEqual(
+            network.reward_gamma, loaded_network.reward_gamma
+        )
+        self.assertEqual(
+            network.epsilon(network.num_trained_steps),
+            loaded_network.epsilon(loaded_network.num_trained_steps)
+        )
+        self.assertEqual(
+            network.train_steps_per_q_sync, loaded_network.train_steps_per_q_sync
+        )
+
+        # Outputs of original and loaded (target) Q networks are identical.
+        # In following comments, prime (') indicates the loaded network.
+        # Q(s) == Q_{target}(s) may not hold, since they may have not been
+        # synchronized yet. Same for Q'(s) and Q'_{target}(s).
+        # Q(s) == Q'(s)
         self.assertTrue(
             np.allclose(
-                network.q_model.predict(test_input),
-                loaded_network.q_model.predict(test_input)
+                network.q_model.predict(test_states),
+                loaded_network.q_model.predict(test_states)
             )
         )
+        # Q_{target}(s) == Q'_{target}(s)
         self.assertTrue(
             np.allclose(
-                network.q_model.predict(test_input),
-                loaded_network.q_model_target.predict(test_input)
+                network.q_model_target.predict(test_states),
+                loaded_network.q_model_target.predict(test_states)
             )
+        )
+
+        # loaded DQN can also be trained
+        loaded_network.train(
+            b_state=test_states,
+            b_action=test_actions,
+            b_reward=test_rewards,
+            b_done=test_dones,
+            b_state_=test_states_
         )
 
         shutil.rmtree(save_path)

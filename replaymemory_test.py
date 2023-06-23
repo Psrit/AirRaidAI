@@ -2,12 +2,12 @@ import unittest
 
 import numpy as np
 
-from replaymemory import FrameTransition, ReplayMemory
+from replaymemory import ObsvTransition, ReplayMemory
 
 
 class ReplayMemoryTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.frame_shape = (2, 3)
+        self.obsv_shape = (2, 3)
         self.n_actions = 5
         return super().setUp()
 
@@ -16,17 +16,18 @@ class ReplayMemoryTest(unittest.TestCase):
             counts = memory.capacity
         for i in range(0, counts):
             memory.add(
-                FrameTransition(
-                    frame=np.random.rand(*self.frame_shape),
+                ObsvTransition(
+                    observation=np.random.rand(*self.obsv_shape),
                     action=np.random.randint(0, self.n_actions),
                     reward=i,
-                    done=True
+                    done=True,
+                    observation_=None  # just for test
                 )
             )
 
     def test_is_valid_index(self):
         memory1 = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=2,
             hist_type="linear",
@@ -57,7 +58,7 @@ class ReplayMemoryTest(unittest.TestCase):
         )
 
         memory2 = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=2,
             hist_type="linear",
@@ -80,7 +81,7 @@ class ReplayMemoryTest(unittest.TestCase):
 
     def test_sample(self):
         memory1 = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=2,
             hist_type="linear",
@@ -96,7 +97,7 @@ class ReplayMemoryTest(unittest.TestCase):
             memory1.sample(100)
 
         memory2 = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=20,
             hist_len=3,
             hist_type="linear",
@@ -132,7 +133,7 @@ class ReplayMemoryTest(unittest.TestCase):
 
     def test_sample_range_raise(self):
         memory = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=3,
             hist_type="linear",
@@ -145,7 +146,7 @@ class ReplayMemoryTest(unittest.TestCase):
 
     def test_construct_current_state(self):
         memory = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=3,
             hist_type="linear",
@@ -153,14 +154,14 @@ class ReplayMemoryTest(unittest.TestCase):
         )
         self.assertTrue(np.array_equal(
             memory.construct_current_state(
-                np.random.rand(*self.frame_shape)
+                np.random.rand(*self.obsv_shape)
             )[:-1],
-            np.zeros((2, *self.frame_shape))
+            np.zeros((2, *self.obsv_shape))
         ))
 
         for i in range(0, 11):
-            memory.add(FrameTransition(
-                np.ones(self.frame_shape) * i,
+            memory.add(ObsvTransition(
+                np.ones(self.obsv_shape) * i,
                 action=np.random.randint(self.n_actions),
                 reward=i,
                 done=False
@@ -171,24 +172,24 @@ class ReplayMemoryTest(unittest.TestCase):
         print(memory.dones)
         self.assertTrue(np.array_equal(
             memory.construct_current_state(
-                np.random.rand(*self.frame_shape)
+                np.random.rand(*self.obsv_shape)
             )[:-1],
             np.array([
-                np.ones(self.frame_shape) * 0,
-                np.ones(self.frame_shape) * 8
+                np.ones(self.obsv_shape) * 0,
+                np.ones(self.obsv_shape) * 8
             ])
         ))
 
     def test_construct_current_state_shortest_hist_len(self):
         memory = ReplayMemory(
-            frame_shape=self.frame_shape,
+            observation_shape=self.obsv_shape,
             capacity=10,
             hist_len=1,
             hist_type="linear",
             # `hist_spacing` can be any value since hist_index_shifts = [0]
             hist_spacing=3
         )
-        frame = np.random.rand(*self.frame_shape)
+        frame = np.random.rand(*self.obsv_shape)
         self.assertTrue(np.array_equal(
             memory.construct_current_state(frame),
             [frame.astype(memory.dtype)]
